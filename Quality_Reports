@@ -1,0 +1,1794 @@
+from pathlib import Path
+import time
+
+import keyboard
+import pyautogui
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    Error as PlaywrightError,
+)
+
+# ============================================================
+# CUSTOM EXCEPTION
+# ============================================================
+
+class SaveVerificationError(Exception):
+    """Raised when the expected PDF cannot be verified."""
+pass
+
+# ============================================================
+# PAUSE / STOP CONTROL
+# ============================================================
+
+paused = False
+stop_requested = False
+
+
+def toggle_pause():
+    global paused
+
+    if not paused:
+
+        paused = True
+
+        print()
+        print("===================================================")
+        print("PAUSED")
+        print("Press F8 to resume.")
+        print("===================================================")
+
+    else:
+
+        paused = False
+
+        print()
+        print("===================================================")
+        print("RESUMING IN 5 SECONDS...")
+        print("===================================================")
+
+        for resume_seconds in range(5, 0, -1):
+
+            print(
+                f"  {resume_seconds}..."
+            )
+
+            time.sleep(1)
+
+        print()
+        print("Continuing...")
+
+
+def request_stop():
+    global stop_requested
+
+    stop_requested = True
+
+    print()
+    print("===================================================")
+    print("STOP REQUESTED")
+    print("The current report will finish, then the script will stop.")
+    print("===================================================")
+
+
+keyboard.add_hotkey(
+    "f8",
+    toggle_pause
+)
+
+keyboard.add_hotkey(
+    "f9",
+    request_stop
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+EHS_REPORT_URL = "YOUR_URL_HERE"
+# None = process all missing reports
+# 1 = process first missing report only
+# 5 = process first 5 missing reports
+
+TEST_LIMIT = None
+
+# Folder where PDFs will be saved
+DOWNLOAD_DIR = (
+    Path.home()
+    / "Downloads"
+)
+
+# Failure log
+FAILED_LOG = (
+    DOWNLOAD_DIR
+    / "EHS_failed_reports.txt"
+)
+
+# ============================================================
+# VERIFY SAVED PDF
+# ============================================================
+
+def verify_saved_pdf(output_file, timeout_seconds=5):
+    """
+    Verify that the expected PDF was actually saved.
+
+    Returns True only when:
+        1. The exact expected filename exists.
+        2. The file has a size greater than zero.
+
+    Returns False if the file does not appear within the timeout.
+    """
+
+    print()
+    print("Verifying saved PDF...")
+    print(
+        f"Expected file: {output_file.name}"
+    )
+
+    for elapsed_seconds in range(
+        1,
+        timeout_seconds + 1
+    ):
+
+        if output_file.exists():
+
+            try:
+
+                file_size = (
+                    output_file.stat().st_size
+                )
+
+            except OSError as file_error:
+
+                print()
+                print(
+                    "File appeared, but its size "
+                    "could not be checked."
+                )
+
+                print(
+                    f"Error: {file_error}"
+                )
+
+                time.sleep(1)
+                continue
+
+            # ------------------------------------------------ #
+            # CHECK FILE IS NOT EMPTY
+            # ------------------------------------------------
+
+            if file_size > 0:
+
+                print()
+                print(
+                    "PDF SAVE VERIFIED."
+                )
+
+                print(
+                    f"Filename: {output_file.name}"
+                )
+
+                print(
+                    f"File size: {file_size:,} bytes"
+                )
+
+                return True
+
+        # ----------------------------------------------------
+        # STATUS
+        # ----------------------------------------------------
+
+        if elapsed_seconds % 5 == 0:
+
+            print(
+                f"  PDF not detected yet... "
+                f"{elapsed_seconds}/{timeout_seconds} seconds"
+            )
+
+        time.sleep(1)
+
+    print()
+    print(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    )
+
+    print(
+        "PDF SAVE VERIFICATION FAILED"
+    )
+
+    print(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    )
+
+    print(
+        f"Expected file was not found:"
+    )
+
+    print(
+        f"  {output_file}"
+    )
+
+    return False
+
+
+# ============================================================
+# SCAN EXISTING DOWNLOADS
+# ============================================================
+
+print()
+print("===================================================")
+print("SCANNING DOWNLOADS")
+print("===================================================")
+
+print()
+print(
+    "Scanning Downloads folder for existing PDFs..."
+)
+
+
+existing_pdfs = {
+    pdf_file.name
+    for pdf_file in DOWNLOAD_DIR.iterdir()
+    if pdf_file.is_file()
+    and pdf_file.suffix.lower() == ".pdf"
+}
+
+
+print(
+    f"Found {len(existing_pdfs)} existing PDF files."
+)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+with sync_playwright() as playwright:
+
+    browser = playwright.chromium.launch(
+        headless=False
+    )
+
+    page = browser.new_page()
+
+
+    # ========================================================
+    # OPEN EHS
+    # ========================================================
+
+    print()
+    print(
+        "Opening EHS Insight..."
+    )
+
+
+    page.goto(
+        EHS_REPORT_URL
+    )
+
+
+    print()
+    print("===================================================")
+    print("Log into EHS Insight if necessary.")
+    print("Navigate to the Quality Inspection Report List.")
+    print("===================================================")
+
+
+    input(
+        "When the report list is visible, press ENTER here..."
+    )
+
+
+    # ========================================================
+    # SET TABLE TO 200 REPORTS PER PAGE
+    # ========================================================
+
+    print()
+    print(
+        "Setting reports to 200 per page..."
+    )
+
+
+    page.locator(
+        "a.dropdown-toggle"
+    ).filter(
+        has_text="Show"
+    ).click()
+
+
+    page.get_by_text(
+        "Show 200 Per Page",
+        exact=True
+    ).click()
+
+
+    page.wait_for_timeout(
+        3000
+    )
+
+
+    # ========================================================
+    # EXTRACT REPORT RECORDS
+    # ========================================================
+
+    print()
+    print("===================================================")
+    print("EXTRACTING REPORT RECORDS")
+    print("===================================================")
+
+
+    report_records = page.evaluate(
+        """
+        () => {
+
+            const table =
+                document.querySelector(
+                    "table.table-bordered.table-vail"
+                );
+
+
+            if (!table) {
+
+                throw new Error(
+                    "Quality Inspection report table was not found."
+                );
+            }
+
+
+            const view_model =
+                ko.dataFor(table);
+
+
+            if (!view_model) {
+
+                throw new Error(
+                    "Knockout ViewModel was not found."
+                );
+            }
+
+
+            if (!view_model.QueryWrapper) {
+
+                throw new Error(
+                    "QueryWrapper was not found."
+                );
+            }
+
+
+            const data =
+                view_model.QueryWrapper.Data();
+
+
+            if (
+                !data ||
+                !Array.isArray(data.Rows)
+            ) {
+
+                throw new Error(
+                    "Report data rows were not found."
+                );
+            }
+
+
+            const seen_guids =
+                new Set();
+
+
+            const results =
+                [];
+
+
+            for (const row of data.Rows) {
+
+                const record_guid =
+                    row.RowUID;
+
+
+                const form_number =
+                    row.FormNumber;
+
+
+                if (
+                    typeof record_guid !== "string" ||
+                    !record_guid.length
+                ) {
+
+                    continue;
+                }
+
+
+                if (
+                    seen_guids.has(record_guid)
+                ) {
+
+                    continue;
+                }
+
+
+                seen_guids.add(
+                    record_guid
+                );
+
+
+                results.push({
+
+                    record_guid:
+                        record_guid,
+
+                    report_id:
+                        typeof form_number === "string" &&
+                        form_number.length
+                            ? form_number
+                            : null
+
+                });
+            }
+
+
+            return results;
+        }
+        """
+    )
+
+
+    print()
+    print(
+        f"Unique inspections: "
+        f"{len(report_records)}"
+    )
+
+
+    if not report_records:
+
+        raise RuntimeError(
+            "No Quality Inspection records were found."
+        )
+
+
+    print(
+        "Report extraction successful."
+    )
+
+
+    # ========================================================
+    # DETERMINE MISSING REPORTS
+    # ========================================================
+
+    reports_to_download = []
+
+    already_downloaded = 0
+
+
+    for original_position, report_record in enumerate(
+        report_records,
+        start=1
+    ):
+
+        record_guid = (
+            report_record[
+                "record_guid"
+            ]
+        )
+
+
+        report_id = (
+            report_record[
+                "report_id"
+            ]
+        )
+
+
+        if not report_id:
+
+            report_id = (
+                "QualityInspection"
+            )
+
+
+        filename = (
+            f"{report_id}_{record_guid}.pdf"
+        )
+
+
+        if filename in existing_pdfs:
+
+            already_downloaded += 1
+
+            continue
+
+
+        reports_to_download.append({
+
+            "original_position":
+                original_position,
+
+            "record_guid":
+                record_guid,
+
+            "report_id":
+                report_id
+
+        })
+
+
+        if (
+            TEST_LIMIT is not None
+            and
+            len(reports_to_download)
+            >= TEST_LIMIT
+        ):
+
+            break
+
+
+    # ========================================================
+    # DOWNLOAD CHECK
+    # ========================================================
+
+    print()
+    print("=" * 51)
+    print("DOWNLOAD CHECK")
+    print("=" * 51)
+
+
+    print(
+        f"Total unique reports:  "
+        f"{len(report_records)}"
+    )
+
+
+    print(
+        f"Already downloaded:    "
+        f"{already_downloaded}"
+    )
+
+
+    print(
+        f"Selected this run:     "
+        f"{len(reports_to_download)}"
+    )
+
+
+    if reports_to_download:
+
+        print()
+        print(
+            "Reports selected:"
+        )
+
+
+        for selected_report in reports_to_download:
+
+            print(
+                f"  "
+                f"{selected_report['original_position']}"
+                f" → "
+                f"{selected_report['report_id']}"
+            )
+
+
+    total_reports = len(
+        report_records
+    )
+
+
+    # ========================================================
+    # PROCESSING COUNTERS
+    # ========================================================
+
+    successful = 0
+
+    skipped = already_downloaded
+
+    failed = 0
+
+
+    # ========================================================
+    # FAILURE LOG
+    # ========================================================
+
+    FAILED_LOG.write_text(
+        "EHS Insight PDF Download Failures\n"
+        "=================================\n\n",
+        encoding="utf-8"
+    )
+
+
+    # ========================================================
+    # PROCESS REPORTS
+    # ========================================================
+
+    for report_info in reports_to_download:
+
+
+        # ----------------------------------------------------
+        # PAUSE
+        # ----------------------------------------------------
+
+        while paused:
+
+            time.sleep(
+                0.25
+            )
+
+
+        # ----------------------------------------------------
+        # STOP
+        # ----------------------------------------------------
+
+        if stop_requested:
+
+            print()
+            print(
+                "Stop requested. Ending download run."
+            )
+
+            break
+
+
+        original_position = (
+            report_info[
+                "original_position"
+            ]
+        )
+
+
+        record_guid = (
+            report_info[
+                "record_guid"
+            ]
+        )
+
+
+        report_id = (
+            report_info[
+                "report_id"
+            ]
+        )
+
+
+        print()
+        print(
+            "==================================================="
+        )
+
+
+        print(
+            f"REPORT {original_position} OF "
+            f"{total_reports}"
+        )
+
+
+        print(
+            "==================================================="
+        )
+
+
+        print()
+        print(
+            f"Record GUID: "
+            f"{record_guid}"
+        )
+
+
+        print(
+            f"Report ID:   "
+            f"{report_id}"
+        )
+
+
+        try:
+
+            # =================================================
+            # CONSTRUCT REPORT URL
+            # =================================================
+
+            report_href = (
+                f"#/entity/QualityInspection/edit/"
+                f"{record_guid}"
+            )
+
+
+            base_url = (
+                page.url.split("#")[0]
+            )
+
+
+            report_url = (
+                base_url
+                + report_href
+            )
+
+
+            print()
+            print(
+                "Opening report..."
+            )
+
+
+            print(
+                f"URL: {report_url}"
+            )
+
+
+            page.goto(
+                report_url
+            )
+
+
+            # =================================================
+            # WAIT FOR DOCUMENT
+            # =================================================
+
+            print()
+            print(
+                "Waiting for EHS report to load..."
+            )
+
+
+            try:
+
+                page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=60000
+                )
+
+            except PlaywrightTimeoutError:
+
+                print()
+                print(
+                    "Document load state exceeded 60 seconds."
+                )
+
+                print(
+                    "Continuing with EHS application rendering..."
+                )
+
+
+            # =================================================
+            # WAIT FOR EHS PRINT CONTROL
+            # =================================================
+
+            print()
+            print(
+                "Waiting for EHS Print control..."
+            )
+
+
+            print_button = page.get_by_text(
+                "Print",
+                exact=True
+            ).first
+
+
+            try:
+
+                print_button.wait_for(
+                    state="attached",
+                    timeout=180000
+                )
+
+            except PlaywrightTimeoutError:
+
+                raise RuntimeError(
+                    "EHS Print control did not appear "
+                    "within 180 seconds."
+                )
+
+
+            print()
+            print(
+                "EHS Print control is present."
+            )
+
+
+            # =================================================
+            # VERIFY REPORT IS ACTUALLY READY
+            # =================================================
+
+            print()
+            print(
+                "Verifying that the report has finished rendering..."
+            )
+
+
+            max_render_wait = 180
+
+            render_wait = 0
+
+            stable_seconds = 0
+
+            required_stable_seconds = 2
+
+            report_ready = False
+
+
+            loading_selector = """
+                .loading,
+                .loader,
+                .spinner,
+                .loading-spinner,
+                .k-loading-mask,
+                .k-loading-image,
+                .blockUI,
+                .busy,
+                [aria-busy="true"]
+            """
+
+
+            while render_wait < max_render_wait:
+
+                time.sleep(1)
+
+                render_wait += 1
+
+
+                # =================================================
+                # PRINT VISIBILITY
+                # =================================================
+
+                try:
+
+                    print_visible = (
+                        print_button.is_visible()
+                    )
+
+                except (
+                    PlaywrightError,
+                    PlaywrightTimeoutError
+                ):
+
+                    print_visible = False
+
+
+                # =================================================
+                # PRINT ENABLED
+                # =================================================
+
+                if print_visible:
+
+                    try:
+
+                        print_enabled = (
+                            print_button.is_enabled()
+                        )
+
+                    except (
+                        PlaywrightError,
+                        PlaywrightTimeoutError
+                    ):
+
+                        print_enabled = False
+
+                else:
+
+                    print_enabled = False
+
+
+                # =================================================
+                # PRINT SCREEN POSITION
+                # =================================================
+
+                print_box = None
+
+                if print_visible:
+
+                    try:
+
+                        print_box = (
+                            print_button.bounding_box()
+                        )
+
+                    except (
+                        PlaywrightError,
+                        PlaywrightTimeoutError
+                    ):
+
+                        print_box = None
+
+
+                has_real_size = (
+                    print_box is not None
+                    and
+                    print_box["width"] > 0
+                    and
+                    print_box["height"] > 0
+                )
+
+
+                # =================================================
+                # CHECK VISIBLE LOADING INDICATORS
+                # =================================================
+
+                visible_loading_count = 0
+
+                try:
+
+                    loading_elements = page.locator(
+                        loading_selector
+                    )
+
+                    loading_count = (
+                        loading_elements.count()
+                    )
+
+
+                    for loading_index in range(
+                        loading_count
+                    ):
+
+                        try:
+
+                            loading_element = (
+                                loading_elements.nth(
+                                    loading_index
+                                )
+                            )
+
+                            if loading_element.is_visible():
+
+                                visible_loading_count += 1
+
+                        except (
+                            PlaywrightError,
+                            PlaywrightTimeoutError
+                        ):
+
+                            continue
+
+                except (
+                    PlaywrightError,
+                    PlaywrightTimeoutError
+                ):
+
+                    visible_loading_count = 0
+
+
+                # =================================================
+                # DETERMINE READY STATE
+                # =================================================
+
+                ready_now = (
+                    print_visible
+                    and
+                    print_enabled
+                    and
+                    has_real_size
+                    and
+                    visible_loading_count == 0
+                )
+
+
+                # =================================================
+                # REQUIRE SHORT STABLE PERIOD
+                # =================================================
+
+                if ready_now:
+
+                    stable_seconds += 1
+
+                else:
+
+                    stable_seconds = 0
+
+
+                # =================================================
+                # STATUS
+                # =================================================
+
+                if render_wait % 5 == 0:
+
+                    print()
+
+                    print(
+                        f"  Verifying report... "
+                        f"{render_wait}s"
+                    )
+
+                    print(
+                        f"  Print visible: "
+                        f"{print_visible}"
+                    )
+
+                    print(
+                        f"  Print enabled: "
+                        f"{print_enabled}"
+                    )
+
+                    print(
+                        f"  Loading indicators: "
+                        f"{visible_loading_count}"
+                    )
+
+                    print(
+                        f"  Stable: "
+                        f"{stable_seconds}/"
+                        f"{required_stable_seconds}"
+                    )
+
+
+                # =================================================
+                # REPORT READY
+                # =================================================
+
+                if (
+                    stable_seconds
+                    >= required_stable_seconds
+                ):
+
+                    report_ready = True
+
+                    print()
+
+                    print(
+                        "==================================================="
+                    )
+
+                    print(
+                        "EHS REPORT VERIFIED READY"
+                    )
+
+                    print(
+                        "==================================================="
+                    )
+
+                    print(
+                        "Print control is visible, enabled, "
+                        "and fully rendered."
+                    )
+
+                    print(
+                        "No visible loading indicators detected."
+                    )
+
+                    print(
+                        f"Ready state stable for "
+                        f"{required_stable_seconds} seconds."
+                    )
+
+                    print()
+
+                    break
+
+
+            # =================================================
+            # REPORT FAILED TO BECOME READY
+            # =================================================
+
+            if not report_ready:
+
+                raise RuntimeError(
+                    "EHS report did not pass the "
+                    "ready-state verification within "
+                    f"{max_render_wait} seconds."
+                )
+
+
+            # =================================================
+            # FILENAME
+            # =================================================
+
+            filename = (
+                f"{report_id}_{record_guid}.pdf"
+            )
+
+
+            output_file = (
+                DOWNLOAD_DIR
+                / filename
+            )
+
+
+            print()
+            print(
+                f"Filename: "
+                f"{filename}"
+            )
+
+
+            # =================================================
+            # SAFETY CHECK
+            # =================================================
+
+            if output_file.exists():
+
+                print()
+                print(
+                    "PDF already exists."
+                )
+
+                print(
+                    f"Skipping: "
+                    f"{output_file}"
+                )
+
+                skipped += 1
+
+                continue
+
+
+            # =================================================
+            # OPEN EHS PRINT MENU
+            # =================================================
+
+            print()
+            print(
+                "Opening Print menu..."
+            )
+
+
+            try:
+
+                print_button.click(
+                    timeout=30000
+                )
+
+            except PlaywrightTimeoutError:
+
+                print()
+                print(
+                    "Normal Print click timed out."
+                )
+
+                print(
+                    "Using DOM click..."
+                )
+
+                print_button.evaluate(
+                    """
+                    element => element.click()
+                    """
+                )
+
+
+            print()
+            print(
+                "Print menu command sent."
+            )
+
+
+            # =================================================
+            # WAIT FOR PRINT FORM AND DISCUSSION
+            # =================================================
+
+            print()
+            print(
+                "Waiting for Print Form and Discussion..."
+            )
+
+
+            print_form_discussion = (
+                page.get_by_text(
+                    "Print Form and Discussion",
+                    exact=True
+                )
+            )
+
+
+            try:
+
+                print_form_discussion.wait_for(
+                    state="visible",
+                    timeout=120000
+                )
+
+            except PlaywrightTimeoutError:
+
+                raise RuntimeError(
+                    "Print Form and Discussion did not "
+                    "appear within 120 seconds."
+                )
+
+
+            print()
+            print(
+                "Selecting Print Form and Discussion..."
+            )
+
+
+            print_form_discussion.click()
+
+
+            # =================================================
+            # WAIT FOR NATIVE PRINT PREVIEW
+            # =================================================
+            #
+            # Edge's print preview is a browser/native UI
+            # surface, so Playwright does not reliably expose
+            # it as a new page.
+            #
+            # We therefore wait a short amount of time for EHS
+            # to create the preview, then switch to it using
+            # Alt+Tab.
+            #
+            # =================================================
+
+            print()
+            print(
+                "Waiting for print preview to open..."
+            )
+
+
+            print(
+                "EHS is generating the print preview..."
+            )
+
+
+            preview_wait = 0
+
+            max_preview_wait = 5
+
+
+            while preview_wait < max_preview_wait:
+
+                time.sleep(1)
+
+                preview_wait += 1
+
+
+                if preview_wait % 5 == 0:
+
+                    print(
+                        f"  Waiting for print preview... "
+                        f"{preview_wait} seconds"
+                    )
+
+
+            print()
+            print(
+                "Print preview should now be open."
+            )
+
+
+            # =================================================
+            # SWITCH TO PRINT PREVIEW
+            # =================================================
+
+            print()
+            print(
+                "Switching focus to print preview..."
+            )
+
+
+            pyautogui.hotkey(
+                "alt",
+                "tab"
+            )
+
+
+            time.sleep(
+                1
+            )
+
+
+            print(
+                "Print preview selected."
+            )
+
+
+            # =================================================
+            # SELECT SAVE AS PDF
+            # =================================================
+
+            print()
+            print(
+                "Selecting Save as PDF..."
+            )
+
+
+            for _ in range(5):
+
+                pyautogui.press(
+                    "tab"
+                )
+
+                time.sleep(
+                    0.2
+                )
+
+
+            pyautogui.press(
+                "enter"
+            )
+
+
+            time.sleep(
+                0.5
+            )
+
+
+            pyautogui.press(
+                "home"
+            )
+
+
+            time.sleep(
+                0.2
+            )
+
+
+            pyautogui.press(
+                "down"
+            )
+
+
+            time.sleep(
+                0.2
+            )
+
+
+            pyautogui.press(
+                "enter"
+            )
+
+
+            time.sleep(
+                2
+            )
+
+
+            print(
+                "Save as PDF selected."
+            )
+
+
+            # =================================================
+            # MOVE TO SAVE
+            # =================================================
+
+            print(
+                "Moving to Save..."
+            )
+
+
+            for _ in range(4):
+
+                pyautogui.press(
+                    "tab"
+                )
+
+                time.sleep(
+                    0.2
+                )
+
+
+            pyautogui.press(
+                "enter"
+            )
+
+
+            time.sleep(
+                2
+            )
+
+
+            # =================================================
+            # WINDOWS SAVE AS DIALOG
+            # =================================================
+
+            print()
+            print(
+                "==================================================="
+            )
+
+
+            print(
+                "SAVE AS DIALOG"
+            )
+
+
+            print(
+                "==================================================="
+            )
+
+
+            print(
+                f"Entering filename: "
+                f"{filename}"
+            )
+
+
+            pyautogui.hotkey(
+                "ctrl",
+                "a"
+            )
+
+
+            time.sleep(
+                0.2
+            )
+
+
+            pyautogui.write(
+                filename,
+                interval=0.02
+            )
+
+
+            time.sleep(
+                0.5
+            )
+
+
+            print(
+                "Saving file..."
+            )
+
+
+            pyautogui.press(
+                "enter"
+            )
+
+
+            time.sleep(
+                3
+            )
+
+            # =================================================
+            # VERIFY PDF WAS ACTUALLY SAVED
+            # =================================================
+
+            pdf_saved = verify_saved_pdf(
+                output_file,
+                timeout_seconds=30
+            )
+
+            # =================================================
+            # FAIL-SAFE
+            # =================================================
+
+            if not pdf_saved:
+                print()
+                print(
+                    "==================================================="
+                )
+
+                print(
+                    "FAIL-SAFE ACTIVATED"
+                )
+
+                print(
+                    "==================================================="
+                )
+
+                print(
+                    "The expected PDF was not found."
+                )
+
+                print(
+                    "The script will STOP to prevent additional"
+                )
+
+                print(
+                    "reports from being processed."
+                )
+
+                print()
+                print(
+                    f"Expected filename:"
+                )
+
+                print(
+                    f"  {filename}"
+                )
+
+                print()
+                print(
+                    f"Expected location:"
+                )
+
+                print(
+                    f"  {output_file}"
+                )
+
+                # -------------------------------------------------
+                # Record failure
+                # -------------------------------------------------
+
+                with FAILED_LOG.open(
+                        "a",
+                        encoding="utf-8"
+                ) as failure_log:
+                    failure_log.write(
+                        f"Report ID: {report_id}\n"
+                        f"Record GUID: {record_guid}\n"
+                        f"Expected filename: {filename}\n"
+                        f"Expected path: {output_file}\n"
+                        f"Error: PDF was not found after save operation.\n"
+                        f"{'-' * 60}\n"
+                    )
+
+                print()
+                print(
+                    f"Failure recorded in:"
+                )
+
+                print(
+                    f"  {FAILED_LOG}"
+                )
+
+                # -------------------------------------------------
+                # HARD STOP
+                #
+                # Do NOT continue to the next report.
+                # -------------------------------------------------
+
+                raise SaveVerificationError(
+                    "FAIL-SAFE: Expected PDF was not found. "
+                    "The download process has been stopped."
+                )
+
+            # =================================================
+            # SUCCESS
+            # =================================================
+
+            print()
+            print(
+                "SUCCESS!"
+            )
+
+
+            print(
+                f"Saved: "
+                f"{output_file}"
+            )
+
+
+            successful += 1
+
+
+            existing_pdfs.add(
+                filename
+            )
+
+
+            # =================================================
+            # RETURN TO EHS
+            # =================================================
+
+            print()
+            print(
+                "Returning to browser..."
+            )
+
+
+            pyautogui.hotkey(
+                "alt",
+                "tab"
+            )
+
+
+            time.sleep(
+                1
+            )
+
+        # =====================================================
+        # FAIL-SAFE EXCEPTION
+        #
+        # IMPORTANT:
+        #
+        # This MUST come before the normal error handler.
+        #
+        # It re-raises the exception so the FOR LOOP stops.
+        # =====================================================
+        except SaveVerificationError:
+            print()
+            print(
+                "==================================================="
+            )
+
+            print(
+                "DOWNLOAD PROCESS STOPPED"
+            )
+            print(
+                "==================================================="
+            )
+            print(
+                "The fail-safe detected that the expected " "PDF was not saved."
+            )
+            print()
+            print(
+                "No additional reports will be processed."
+            )
+
+            print()
+
+            raise
+
+        # =====================================================
+        # NORMAL REPORT FAILURE
+        #
+        # These errors DO NOT activate the fail-safe.
+        #
+        # The report is logged and the next report continues.
+        # =====================================================
+
+        except (
+            PlaywrightError,
+            PlaywrightTimeoutError,
+            RuntimeError
+        ) as report_error:
+
+
+            failed += 1
+
+
+            print()
+            print(
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            )
+
+
+            print(
+                "REPORT FAILED"
+            )
+
+
+            print(
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            )
+
+
+            print(
+                f"Report ID:     "
+                f"{report_id}"
+            )
+
+
+            print(
+                f"Record GUID:   "
+                f"{record_guid}"
+            )
+
+
+            print(
+                f"Error:         "
+                f"{report_error}"
+            )
+
+
+            # =================================================
+            # FAILURE LOG
+            # =================================================
+
+            with FAILED_LOG.open(
+                "a",
+                encoding="utf-8"
+            ) as failure_log:
+
+                failure_log.write(
+                    f"Report ID: {report_id}\n"
+                    f"Record GUID: {record_guid}\n"
+                    f"Error: {report_error}\n"
+                    f"{'-' * 60}\n"
+                )
+
+
+            print()
+            print(
+                f"Failure recorded in:\n"
+                f"{FAILED_LOG}"
+            )
+
+
+            # =================================================
+            # RETURN TO BROWSER
+            # =================================================
+
+            print()
+            print(
+                "Attempting to return to browser..."
+            )
+
+
+            try:
+
+                pyautogui.hotkey(
+                    "alt",
+                    "tab"
+                )
+
+                time.sleep(
+                    1
+                )
+
+            except OSError:
+
+                pass
+
+
+        # ====================================================
+        # PROGRESS
+        # ====================================================
+
+        print()
+        print(
+            f"Progress: "
+            f"{successful + failed}/"
+            f"{len(reports_to_download)} "
+            f"processed this run | "
+            f"Successful: {successful} | "
+            f"Skipped: {skipped} | "
+            f"Failed: {failed}"
+        )
+
+
+    # ========================================================
+    # COMPLETE
+    # ========================================================
+
+    print()
+    print(
+        "==================================================="
+    )
+
+
+    print(
+        "DOWNLOAD RUN COMPLETE"
+    )
+
+
+    print(
+        "==================================================="
+    )
+
+
+    print()
+    print(
+        f"Total reports:  "
+        f"{total_reports}"
+    )
+
+
+    print(
+        f"Successful:     "
+        f"{successful}"
+    )
+
+
+    print(
+        f"Skipped:        "
+        f"{skipped}"
+    )
+
+
+    print(
+        f"Failed:         "
+        f"{failed}"
+    )
+
+
+    if failed > 0:
+
+        print()
+        print(
+            "Failed reports were recorded here:"
+        )
+
+
+        print(
+            FAILED_LOG
+        )
+
+    else:
+
+        print()
+        print(
+            "No reports failed."
+        )
+
+
+    print()
+    print(
+        "Check your Downloads folder for the PDFs."
+    )
+
+
+    print()
+    input(
+        "Press ENTER to close..."
+    )
+
+
+    browser.close()
