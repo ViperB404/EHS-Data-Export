@@ -1,0 +1,870 @@
+from pathlib import Path
+import time
+import pandas as pd
+from playwright.sync_api import sync_playwright
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+EHS_URL = "YOUR_URL_HERE"
+
+EXCEL_FILE = Path.home() / "Downloads" / "UserContact.xlsx"
+DOWNLOAD_DIR = Path.home() / "Downloads"
+
+SUCCESS_LOG = DOWNLOAD_DIR / "EHS_certificate_success.txt"
+FAILED_LOG = DOWNLOAD_DIR / "EHS_certificate_failed.txt"
+
+USERNAME_FIELD = 'input[placeholder="Person"]'
+DOWNLOAD_ALL_BUTTON = 'button:has-text("Download All Certificates")'
+
+ELEMENT_TIMEOUT = 30_000
+DOWNLOAD_TIMEOUT = 30_000
+
+SEARCH_DELAY = 2
+DELAY_BETWEEN_USERS = 2
+
+# 1 = test one user
+# 5 = test five users
+# None = process everyone
+TEST_LIMIT = None
+
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# EXCEL
+# ============================================================
+
+def load_usernames():
+
+    if not EXCEL_FILE.exists():
+        raise FileNotFoundError(
+            f"Excel file was not found:\n{EXCEL_FILE}"
+        )
+
+    print("\nReading Excel file...")
+
+    df = pd.read_excel(EXCEL_FILE)
+
+    if df.empty:
+        raise ValueError("The Excel file is empty.")
+
+    # Use column B when available.
+    if len(df.columns) >= 2:
+        names = df.iloc[:, 1]
+    else:
+        names = df.iloc[:, 0]
+
+    usernames = []
+
+    for value in names:
+
+        if pd.isna(value):
+            continue
+
+        username = str(value).strip()
+
+        if not username:
+            continue
+
+        if username.lower() == "fullname":
+            continue
+
+        usernames.append(username)
+
+    if not usernames:
+        raise ValueError(
+            "No users were found in the Excel file."
+        )
+
+    return usernames
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log_success(username, filename):
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(SUCCESS_LOG, "a", encoding="utf-8") as f:
+        f.write(
+            f"{timestamp} | {username} | {filename}\n"
+        )
+
+
+def log_no_certificates(username):
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(SUCCESS_LOG, "a", encoding="utf-8") as f:
+        f.write(
+            f"{timestamp} | {username} | NO CERTIFICATES\n"
+        )
+
+
+def log_emailed(username):
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(SUCCESS_LOG, "a", encoding="utf-8") as f:
+        f.write(
+            f"{timestamp} | {username} | EMAILED BY EHS\n"
+        )
+
+
+def log_failure(username, reason):
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(FAILED_LOG, "a", encoding="utf-8") as f:
+        f.write(
+            f"{timestamp} | {username} | {reason}\n"
+        )
+
+
+# ============================================================
+# FILE NAMING
+# ============================================================
+
+def make_safe_filename(username):
+
+    safe_name = username
+
+    invalid_characters = '<>:"/\\|?*'
+
+    for character in invalid_characters:
+        safe_name = safe_name.replace(character, "_")
+
+    safe_name = safe_name.strip()
+
+    while safe_name.endswith("."):
+        safe_name = safe_name[:-1]
+
+    return safe_name
+
+
+def get_destination(username):
+
+    safe_name = make_safe_filename(username)
+
+    destination = (
+        DOWNLOAD_DIR /
+        f"{safe_name}_Certificates.zip"
+    )
+
+    if not destination.exists():
+        return destination
+
+    counter = 2
+
+    while True:
+
+        destination = (
+            DOWNLOAD_DIR /
+            f"{safe_name}_Certificates_{counter}.zip"
+        )
+
+        if not destination.exists():
+            return destination
+
+        counter += 1
+
+
+# ============================================================
+# POPUP HANDLING
+# ============================================================
+
+def get_visible_ok_buttons(page):
+
+    selectors = [
+        'button:has-text("OK")',
+        'input[type="button"][value="OK"]',
+        'input[type="submit"][value="OK"]'
+    ]
+
+    buttons_found = []
+
+    for selector in selectors:
+
+        try:
+
+            buttons = page.locator(selector)
+
+            count = buttons.count()
+
+            for index in range(count):
+
+                button = buttons.nth(index)
+
+                try:
+
+                    if (
+                        button.is_visible()
+                        and button.is_enabled()
+                    ):
+                        buttons_found.append(button)
+
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+    return buttons_found
+
+
+def click_popup_ok(page):
+
+    buttons = get_visible_ok_buttons(page)
+
+    if not buttons:
+        return False
+
+    # Try the last visible OK button first.
+    # EHS popups commonly place their OK button
+    # near the end of the DOM.
+    for button in reversed(buttons):
+
+        try:
+
+            button.click(
+                timeout=2_000
+            )
+
+            return True
+
+        except Exception:
+            pass
+
+    return False
+
+
+def get_page_text(page):
+
+    try:
+
+        return page.locator("body").inner_text(
+            timeout=1_000
+        ).lower()
+
+    except Exception:
+
+        return ""
+
+
+def detect_email_message(page):
+
+    body_text = get_page_text(page)
+
+    email_phrases = [
+        "will be emailed",
+        "will be sent to your email",
+        "emailed to you",
+        "email will be sent",
+        "sent via email"
+    ]
+
+    for phrase in email_phrases:
+
+        if phrase in body_text:
+            return True
+
+    return False
+
+
+def detect_no_certificate_message(page):
+
+    body_text = get_page_text(page)
+
+    no_certificate_phrases = [
+        "no certificates",
+        "no certificate",
+        "no training certificates",
+        "does not have any certificates",
+        "doesn't have any certificates",
+        "nothing to download",
+        "no files"
+    ]
+
+    for phrase in no_certificate_phrases:
+
+        if phrase in body_text:
+            return True
+
+    return False
+
+
+def handle_special_popup(page):
+
+    # --------------------------------------------------------
+    # Email message
+    # --------------------------------------------------------
+
+    if detect_email_message(page):
+
+        print("  EHS says certificates will be emailed.")
+
+        # Give the popup a moment to finish appearing.
+        page.wait_for_timeout(500)
+
+        # Try clicking OK several times if necessary.
+        for attempt in range(5):
+
+            if click_popup_ok(page):
+
+                print("  OK clicked.")
+
+                # Give EHS time to close the popup.
+                page.wait_for_timeout(500)
+
+                return "emailed"
+
+            page.wait_for_timeout(500)
+
+        # If there is no clickable OK button, try Enter.
+        print("  OK button not found. Trying Enter...")
+
+        try:
+            page.keyboard.press("Enter")
+
+            page.wait_for_timeout(750)
+
+            return "emailed"
+
+        except Exception:
+            return None
+
+
+    # --------------------------------------------------------
+    # No certificates message
+    # --------------------------------------------------------
+
+    if detect_no_certificate_message(page):
+
+        print("  EHS says there are no certificates.")
+
+        page.wait_for_timeout(500)
+
+        for attempt in range(5):
+
+            if click_popup_ok(page):
+
+                print("  OK clicked.")
+
+                page.wait_for_timeout(500)
+
+                return "no_certificates"
+
+            page.wait_for_timeout(500)
+
+        print("  OK button not found. Trying Enter...")
+
+        try:
+
+            page.keyboard.press("Enter")
+
+            page.wait_for_timeout(750)
+
+            return "no_certificates"
+
+        except Exception:
+
+            return None
+
+    return None
+
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+def download_certificates(page, username):
+
+    destination = get_destination(username)
+
+    download_holder = [None]
+
+    def on_download(download):
+        download_holder[0] = download
+
+    page.on("download", on_download)
+
+    try:
+
+        print("  Clicking Download All Certificates...")
+
+        download_button = page.locator(
+            DOWNLOAD_ALL_BUTTON
+        )
+
+        download_button.click()
+
+        start_time = time.time()
+
+        while True:
+
+            # ------------------------------------------------
+            # Check for download
+            # ------------------------------------------------
+
+            if download_holder[0] is not None:
+
+                download = download_holder[0]
+
+                print("  Download detected.")
+
+                failure = download.failure()
+
+                if failure:
+
+                    raise RuntimeError(
+                        f"Browser reported download failure: {failure}"
+                    )
+
+                print("  Saving ZIP...")
+
+                download.save_as(
+                    str(destination)
+                )
+
+                if not destination.exists():
+
+                    raise RuntimeError(
+                        "Downloaded file does not exist after save."
+                    )
+
+                size = destination.stat().st_size
+
+                if size <= 0:
+
+                    raise RuntimeError(
+                        "Downloaded ZIP is empty."
+                    )
+
+                print(
+                    f"  Saved: {destination.name}"
+                )
+
+                print(
+                    f"  Size: {size:,} bytes"
+                )
+
+                return "downloaded", destination
+
+
+            # ------------------------------------------------
+            # Check for EHS popup
+            # ------------------------------------------------
+
+            special_message = handle_special_popup(
+                page
+            )
+
+            if special_message:
+
+                return special_message, None
+
+
+            # ------------------------------------------------
+            # Timeout
+            # ------------------------------------------------
+
+            elapsed = time.time() - start_time
+
+            if elapsed >= DOWNLOAD_TIMEOUT / 1000:
+
+                raise TimeoutError(
+                    "EHS did not start a certificate download "
+                    "or display an email/no-certificate message "
+                    "within 5 minutes."
+                )
+
+            page.wait_for_timeout(500)
+
+    finally:
+
+        try:
+
+            page.remove_listener(
+                "download",
+                on_download
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# PROCESS ONE USER
+# ============================================================
+
+def process_user(page, username):
+
+    print("\n" + "=" * 60)
+    print(f"USER: {username}")
+    print("=" * 60)
+
+    try:
+
+        person_field = page.locator(
+            USERNAME_FIELD
+        )
+
+        person_field.wait_for(
+            state="visible",
+            timeout=ELEMENT_TIMEOUT
+        )
+
+        print("  Entering user...")
+
+        person_field.click()
+
+        person_field.fill(
+            username
+        )
+
+        print("  Selecting user...")
+
+        person_field.press(
+            "Enter"
+        )
+
+        time.sleep(
+            SEARCH_DELAY
+        )
+
+
+        # ----------------------------------------------------
+        # Download button
+        # ----------------------------------------------------
+
+        download_button = page.locator(
+            DOWNLOAD_ALL_BUTTON
+        )
+
+        download_button.wait_for(
+            state="visible",
+            timeout=ELEMENT_TIMEOUT
+        )
+
+        if not download_button.is_enabled():
+
+            raise RuntimeError(
+                "Download All Certificates button is disabled."
+            )
+
+
+        # ----------------------------------------------------
+        # Download
+        # ----------------------------------------------------
+
+        result, destination = download_certificates(
+            page,
+            username
+        )
+
+
+        # ----------------------------------------------------
+        # Emailed
+        # ----------------------------------------------------
+
+        if result == "emailed":
+
+            print(
+                "  RESULT: Certificates will be emailed."
+            )
+
+            log_emailed(
+                username
+            )
+
+            return True, "emailed"
+
+
+        # ----------------------------------------------------
+        # No certificates
+        # ----------------------------------------------------
+
+        if result == "no_certificates":
+
+            print(
+                "  RESULT: No certificates."
+            )
+
+            log_no_certificates(
+                username
+            )
+
+            return True, "no_certificates"
+
+
+        # ----------------------------------------------------
+        # Successful download
+        # ----------------------------------------------------
+
+        print(
+            "  RESULT: Download successful."
+        )
+
+        log_success(
+            username,
+            destination.name
+        )
+
+        return True, "downloaded"
+
+
+    except Exception as e:
+
+        print(
+            "  RESULT: FAILED"
+        )
+
+        print(
+            f"  Reason: {e}"
+        )
+
+        log_failure(
+            username,
+            str(e)
+        )
+
+        return False, "failed"
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 60)
+    print("EHS INSIGHT - BULK CERTIFICATE DOWNLOADER")
+    print("=" * 60)
+
+
+    # --------------------------------------------------------
+    # Load Excel
+    # --------------------------------------------------------
+
+    try:
+
+        usernames = load_usernames()
+
+    except Exception as e:
+
+        print(
+            "\nERROR READING EXCEL:"
+        )
+
+        print(e)
+
+        input(
+            "\nPress Enter to exit..."
+        )
+
+        return
+
+
+    print(
+        f"\nUsers found in Excel: {len(usernames)}"
+    )
+
+
+    # --------------------------------------------------------
+    # Test limit
+    # --------------------------------------------------------
+
+    if TEST_LIMIT is not None:
+
+        usernames = usernames[:TEST_LIMIT]
+
+        print(
+            f"TEST MODE: Processing {len(usernames)} user(s)"
+        )
+
+    else:
+
+        print(
+            "FULL MODE: Processing all users"
+        )
+
+
+    # --------------------------------------------------------
+    # Launch Edge
+    # --------------------------------------------------------
+
+    with sync_playwright() as p:
+
+        print(
+            "\nLaunching Microsoft Edge..."
+        )
+
+        browser = p.chromium.launch(
+            channel="msedge",
+            headless=False
+        )
+
+        context = browser.new_context(
+            accept_downloads=True
+        )
+
+        page = context.new_page()
+
+
+        # ----------------------------------------------------
+        # Open EHS
+        # ----------------------------------------------------
+
+        print(
+            "Opening EHS..."
+        )
+
+        page.goto(
+            EHS_URL,
+            wait_until="domcontentloaded"
+        )
+
+
+        # ----------------------------------------------------
+        # Browser ready
+        # ----------------------------------------------------
+
+        print(
+            "\n" + "=" * 60
+        )
+
+        print(
+            "BROWSER READY"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        print(
+            "\nLog into EHS if necessary and navigate to "
+            "the page containing the Person field."
+        )
+
+        input(
+            "\nWhen the page is ready, press ENTER here..."
+        )
+
+
+        # ----------------------------------------------------
+        # Process users
+        # ----------------------------------------------------
+
+        total = len(usernames)
+
+        successful_downloads = 0
+        emailed = 0
+        no_certificates = 0
+        failed = 0
+
+
+        for number, username in enumerate(
+            usernames,
+            start=1
+        ):
+
+            print(
+                f"\n[{number}/{total}] Processing {username}"
+            )
+
+            result, result_type = process_user(
+                page,
+                username
+            )
+
+
+            if result:
+
+                if result_type == "downloaded":
+
+                    successful_downloads += 1
+
+                elif result_type == "emailed":
+
+                    emailed += 1
+
+                elif result_type == "no_certificates":
+
+                    no_certificates += 1
+
+            else:
+
+                failed += 1
+
+
+            if number < total:
+
+                time.sleep(
+                    DELAY_BETWEEN_USERS
+                )
+
+
+        # ----------------------------------------------------
+        # Summary
+        # ----------------------------------------------------
+
+        print(
+            "\n" + "=" * 60
+        )
+
+        print(
+            "PROCESS COMPLETE"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        print(
+            f"\nTotal processed:       {total}"
+        )
+
+        print(
+            f"Successful downloads:  {successful_downloads}"
+        )
+
+        print(
+            f"Emailed by EHS:        {emailed}"
+        )
+
+        print(
+            f"No certificates:       {no_certificates}"
+        )
+
+        print(
+            f"Failed:                {failed}"
+        )
+
+        print(
+            f"\nZIP files: {DOWNLOAD_DIR}"
+        )
+
+        print(
+            f"Success log: {SUCCESS_LOG}"
+        )
+
+        print(
+            f"Failure log: {FAILED_LOG}"
+        )
+
+        input(
+            "\nPress ENTER to close Edge and exit..."
+        )
+
+        context.close()
+
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()
