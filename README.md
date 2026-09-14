@@ -24,3 +24,11 @@ You will then need to go back to the cmd console once signed in and press enter 
 If it times out on loading or miscalculates the keyboard commands, it has a failsafe that will stop the program by checking if the file was downloaded after.
 
 Success!
+
+
+# ============================================================
+# Certification_Downloads
+# ============================================================
+
+This is more of a test script that was created with the help of ChatGPT to download the current users Training certificate records. There is a minor bug in this one if the record needs to be emailed instead of directly downloaded, but you can just click continue manually if so or change the code to reflect that scenario. I did not have many users to bother with perfecting the whole code so for me it worked well.
+You would need an excel file with all of your users in it from B2-B??? and ensure the code corresponds with those field checks. I added the excel file (UserContact) to my downloads, but feel free to change the saved location in the code if needed.
